@@ -6,6 +6,7 @@
 <title>Carnet de voyage</title>
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#D6247A">
+<script src="firebase-config.js"></script>
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -437,6 +438,11 @@
     text-align:center;font-size:11.5px;color:var(--ink-soft);opacity:.7;
     margin-top:22px;padding-bottom:10px;
   }
+  .sync-note{font-size:13px;color:var(--ink-soft);margin:0 0 12px;line-height:1.45;text-align:justify;}
+  .sync-status{font-size:13.5px;font-weight:700;margin-bottom:12px;}
+  .sync-code{width:100%;padding:10px 11px;border-radius:9px;border:1.5px solid var(--line);font-size:13px;font-family:monospace;background:var(--paper-raised);color:var(--ink);}
+  .sync-row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 14px;}
+  .sync-row .btn{flex:1 1 130px;}
 </style>
 </head>
 <body>
@@ -453,6 +459,7 @@
       <button class="backup-btn" onclick="document.getElementById('importFileInput').click()">⬆️ Restaurer une copie</button>
       <input type="file" id="importFileInput" accept="application/json" style="display:none;" onchange="importData(this.files[0])" />
       <button class="backup-btn" onclick="newTrip()">🆕 Nouveau voyage</button>
+      <button class="backup-btn" id="syncBtn" onclick="openSyncModal()">☁️ Synchro</button>
     </div>
   </div>
 
@@ -733,6 +740,17 @@
       <button class="btn delete" id="actDeleteBtn" onclick="deleteActivity()" style="display:none;">Supprimer</button>
       <button class="btn ghost" onclick="closeActModal()">Annuler</button>
       <button class="btn primary" onclick="saveActivity()">Enregistrer</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Synchronisation -->
+<div class="overlay" id="syncOverlay">
+  <div class="modal">
+    <h3>☁️ Synchronisation</h3>
+    <div id="syncBody"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeSyncModal()">Fermer</button>
     </div>
   </div>
 </div>
@@ -1297,11 +1315,146 @@ function loadState(){
   render();
 }
 
+let deferredRemote = null;
+let deferredTimer = null;
+
 function saveState(){
+  deferredRemote = null; // une modification locale l'emporte sur une mise à jour distante en attente
   try{
     localStorage.setItem('trip-data-v2', JSON.stringify(state));
   }catch(e){
     console.error('Erreur de sauvegarde', e);
+  }
+  try{
+    if(localStorage.getItem('trip-sync-code')) localStorage.setItem('trip-sync-dirty', String(Date.now()));
+  }catch(e){}
+  if(typeof window.__syncSchedule === 'function') window.__syncSchedule();
+}
+
+/* ---------- Synchronisation en temps réel (Firebase) ---------- */
+function getSyncPayload(){
+  const copy = JSON.parse(JSON.stringify(state));
+  (copy.days||[]).forEach(d=>(d.activities||[]).forEach(a=>{ if(a.image) a.image = ''; })); // les photos restent sur l'appareil
+  return JSON.stringify(copy);
+}
+function syncBlocked(){
+  const modal = document.querySelector('#actOverlay.active, #dayOverlay.active');
+  const ae = document.activeElement;
+  return !!modal || !!(ae && (ae.id === 'tripName' || ae.id === 'tripPlace'));
+}
+function applyRemoteState(json){
+  deferredRemote = json;
+  tryApplyRemote();
+}
+function tryApplyRemote(){
+  clearTimeout(deferredTimer);
+  if(deferredRemote === null) return;
+  if(syncBlocked()){ deferredTimer = setTimeout(tryApplyRemote, 1500); return; }
+  let remote;
+  try{ remote = JSON.parse(deferredRemote); }catch(e){ deferredRemote = null; return; }
+  deferredRemote = null;
+  if(!remote || !Array.isArray(remote.days) || remote.days.length === 0) return;
+  const imgs = {};
+  state.days.forEach(d=>(d.activities||[]).forEach(a=>{ if(a.image) imgs[a.id] = a.image; }));
+  remote.days.forEach(d=>(d.activities||[]).forEach(a=>{ if(imgs[a.id] && !a.image) a.image = imgs[a.id]; }));
+  state = remote;
+  try{ localStorage.setItem('trip-data-v2', JSON.stringify(state)); }catch(e){}
+  if(activeDayId !== '__cover__' && !state.days.find(d=>d.id === activeDayId)) activeDayId = '__cover__';
+  render();
+}
+
+function syncShareLink(code){
+  return location.origin + location.pathname.replace(/index\.html$/, '') + '?code=' + code;
+}
+function openSyncModal(){
+  renderSyncModal();
+  document.getElementById('syncOverlay').classList.add('active');
+}
+function closeSyncModal(){
+  document.getElementById('syncOverlay').classList.remove('active');
+}
+function updateSyncUi(){
+  const s = window.__sync;
+  const btn = document.getElementById('syncBtn');
+  if(btn){
+    let label = '☁️ Synchro';
+    if(s && s.code){
+      if(s.status === 'on') label = '☁️ Synchro ✓';
+      else if(s.status === 'offline') label = '☁️ Synchro (hors ligne)';
+      else if(s.status === 'error' || s.status === 'toobig') label = '⚠️ Synchro';
+    }
+    btn.textContent = label;
+  }
+  if(document.getElementById('syncOverlay').classList.contains('active')) renderSyncModal();
+}
+window.onSyncStatus = function(){ updateSyncUi(); };
+
+function renderSyncModal(){
+  const body = document.getElementById('syncBody');
+  const s = window.__sync;
+  const note = (t)=>`<p class="sync-note">${t}</p>`;
+  if(!s || s.status === 'loading'){
+    body.innerHTML = note("Chargement du service de synchronisation… Si ce message reste affiché, vérifiez votre connexion internet puis rouvrez l'appli.");
+    return;
+  }
+  if(s.status === 'unconfigured'){
+    body.innerHTML = note("La synchronisation n'est pas encore activée : il manque les identifiants Firebase dans le fichier <b>firebase-config.js</b>.");
+    return;
+  }
+  if(s.status === 'unavailable'){
+    body.innerHTML = note("Impossible de joindre le service de synchronisation (pas de connexion ?). Réessayez avec du réseau." + (s.detail ? `<br><small>${escapeHtml(s.detail)}</small>` : ''));
+    return;
+  }
+  if(!s.code){
+    body.innerHTML =
+      (s.status === 'notfound' ? '<p class="sync-status" style="color:var(--danger);">Aucun voyage trouvé avec ce code.</p>' : '') +
+      note('Partagez ce voyage pour le retrouver en direct sur votre téléphone et sur votre PC.') +
+      '<button class="btn primary" style="width:100%;" onclick="syncCreate()">Partager ce voyage (créer un code)</button>' +
+      '<div class="field" style="margin-top:18px;"><label>Ou rejoindre un voyage déjà partagé (code ou lien)</label>' +
+      '<input id="syncJoinInput" placeholder="Collez le code ou le lien ici" /></div>' +
+      '<button class="btn ghost" style="width:100%;" onclick="syncJoin()">Rejoindre ce voyage</button>';
+    return;
+  }
+  const texts = {
+    connecting: 'Connexion en cours…',
+    on: '✅ Synchronisé en direct',
+    offline: '📴 Hors ligne : vos modifications partiront dès le retour du réseau',
+    toobig: '⚠️ Voyage trop volumineux pour être synchronisé',
+    error: '⚠️ Erreur de synchronisation' + (s.detail ? ' (' + s.detail + ')' : '')
+  };
+  body.innerHTML = `
+    <div class="sync-status">${escapeHtml(texts[s.status] || s.status)}</div>
+    <div class="field"><label>Code du voyage</label><input class="sync-code" readonly value="${escapeAttr(s.code)}" /></div>
+    <div class="sync-row">
+      <button class="btn primary" onclick="syncCopy(syncShareLink(window.__sync.code), 'Lien copié')">Copier le lien</button>
+      <button class="btn ghost" onclick="syncCopy(window.__sync.code, 'Code copié')">Copier le code</button>
+    </div>
+    <p class="sync-note">⚠️ Toute personne qui a ce lien ou ce code peut voir et modifier le voyage. Ne le partagez qu'avec ceux qui doivent y accéder. Les photos restent sur l'appareil où elles ont été ajoutées.</p>
+    <button class="btn delete" style="width:100%;" onclick="syncStop()">Arrêter la synchronisation sur cet appareil</button>`;
+}
+function syncCreate(){
+  if(window.__syncCreate) window.__syncCreate();
+}
+function syncJoin(){
+  const raw = (document.getElementById('syncJoinInput').value || '').trim();
+  let code = raw;
+  const m = raw.match(/code=([a-z0-9]+)/i);
+  if(m) code = m[1];
+  code = code.toLowerCase();
+  if(!/^[a-z0-9]{16,40}$/.test(code)){ alert('Ce code ne semble pas valide.'); return; }
+  if(!confirm("Les données de cet appareil seront remplacées par le voyage partagé. Faites d'abord une sauvegarde si besoin. Continuer ?")) return;
+  if(window.__syncJoin) window.__syncJoin(code);
+}
+function syncStop(){
+  if(confirm("Arrêter la synchronisation sur cet appareil ? Le voyage reste affiché ici mais n'est plus partagé.")){
+    if(window.__syncDisconnect) window.__syncDisconnect();
+  }
+}
+function syncCopy(text, okMsg){
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(()=>alert(okMsg)).catch(()=>{ prompt('Copiez ce texte :', text); });
+  } else {
+    prompt('Copiez ce texte :', text);
   }
 }
 
@@ -1329,7 +1482,8 @@ function importData(file){
     try{
       const parsed = JSON.parse(e.target.result);
       if(!parsed || !Array.isArray(parsed.days)) throw new Error('format invalide');
-      if(!confirm('Remplacer les données actuelles par cette sauvegarde ?')) return;
+      const syncNote = (window.__sync && window.__sync.code) ? '\n\nAttention : ce voyage est partagé, la sauvegarde remplacera aussi le voyage sur vos autres appareils.' : '';
+      if(!confirm('Remplacer les données actuelles par cette sauvegarde ?' + syncNote)) return;
       state = parsed;
       saveState();
       activeDayId = '__cover__';
@@ -1351,6 +1505,7 @@ function newTrip(){
   if(!wantsBackup) return;
   exportData();
   if(!confirm("Sauvegarde téléchargée. Continuer et créer un nouveau voyage vierge maintenant ?")) return;
+  if(window.__sync && window.__sync.code && window.__syncDisconnect) window.__syncDisconnect();
   state = {
     tripName: "Nouveau voyage",
     tripPlace: "",
@@ -2092,10 +2247,12 @@ function moveActivity(dayId, activityId, dir){
 }
 
 loadState();
+updateSyncUi();
 setInterval(render, 60000);
 if('serviceWorker' in navigator && location.protocol.indexOf('http') === 0){
   window.addEventListener('load', ()=>{ navigator.serviceWorker.register('sw.js').catch(()=>{}); });
 }
 </script>
+<script type="module" src="sync.js"></script>
 </body>
 </html>

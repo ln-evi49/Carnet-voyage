@@ -1,6 +1,6 @@
 // Mode hors ligne du carnet de voyage
-const CACHE = 'carnet-voyage-v1';
-const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
+const CACHE = 'carnet-voyage-v2';
+const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './sync.js', './firebase-config.js'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -19,12 +19,13 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
 
-  // Polices Google : on les garde en mémoire après le 1er chargement
-  if (url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com') {
+  // Polices Google et bibliothèque Firebase : copie gardée après le 1er chargement
+  const cdn = url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com' || (url.hostname === 'www.gstatic.com' && url.pathname.indexOf('/firebasejs/') === 0);
+  if (cdn) {
     event.respondWith(
       caches.open(CACHE).then((cache) =>
         cache.match(req).then((hit) => {
-          const net = fetch(req).then((res) => { cache.put(req, res.clone()); return res; }).catch(() => hit);
+          const net = fetch(req).then((res) => { if (res && res.ok) cache.put(req, res.clone()); return res; }).catch(() => hit);
           return hit || net;
         })
       )
@@ -34,16 +35,13 @@ self.addEventListener('fetch', (event) => {
 
   if (url.origin !== self.location.origin) return;
 
-  // Page principale : on tente le réseau (pour avoir les mises à jour), sinon la copie en mémoire
-  if (req.mode === 'navigate' || url.pathname.endsWith('/index.html')) {
-    event.respondWith(
-      fetch(req)
-        .then((res) => { const copy = res.clone(); caches.open(CACHE).then((c) => c.put('./index.html', copy)); return res; })
-        .catch(() => caches.match('./index.html'))
-    );
-    return;
-  }
-
-  // Le reste (icônes, manifeste) : copie en mémoire d'abord
-  event.respondWith(caches.match(req).then((hit) => hit || fetch(req)));
+  // Fichiers de l'appli : réseau d'abord (pour avoir les mises à jour), sinon copie en mémoire
+  event.respondWith(
+    fetch(req)
+      .then((res) => {
+        if (res && res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
+        return res;
+      })
+      .catch(() => caches.match(req).then((hit) => hit || (req.mode === 'navigate' ? caches.match('./index.html') : undefined)))
+  );
 });
